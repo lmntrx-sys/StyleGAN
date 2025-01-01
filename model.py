@@ -12,382 +12,375 @@
 
 import numpy as np
 import torch
-from typing import Optional, Tuple
-
 import torch.nn as nn
-import math
 import torch.nn.functional as F
 
-import torch
-import torch.nn as nn
 
-class ExampleModule(nn.Module):
+class EqualizedWeight(nn.Module):
+
     def __init__(self, shape):
-        super(ExampleModule, self).__init__()
-        # Ensure shape is a tuple of ints
-        if not isinstance(shape, tuple):
-            raise TypeError("shape must be a tuple")
-        if not all(isinstance(dim, int) for dim in shape):
-            shape = tuple(int(dim) for dim in shape)  # Convert to int if needed
-        self.weight = nn.Parameter(torch.randn(shape))
 
-# Example usage
-shape = (3, 4)  # Valid shape
-model = ExampleModule(shape)
-print(model.weight)
-
-
-class EqualizedWeights(nn.Module):
-
-    def __init__(self, shape: Tuple[int, ...]):
-        """
-        Initialize the EqualizedWeights module.
-
-        Args:
-            shape (List[int]): Shape of the weight tensor.
-
-        Attributes:
-            weight (nn.Parameter): Learnable weight tensor.
-            c (float): Constant value used in the forward method.
-
-        """
         super().__init__()
 
-
+        self.c = 1 / np.sqrt(np.prod(shape[1:]))
         self.weight = nn.Parameter(torch.randn(shape))
-        self.c = 1 / math.sqrt(np.prod(shape[1:]))
-
 
     def forward(self):
-        
+        """
+        Multiply the weight by the constant c.
+
+        Returns:
+            torch.Tensor: The result of weight * c
+        """
         return self.weight * self.c
-    
+
 class EqualizedLinear(nn.Module):
 
-    def __init__(self, in_features: int, out_features: int):
+    def __init__(self, in_features, out_features, bias = 0.):
 
-        """
-        Initialize the EqualizedLinear module.
-
-        Args:
-            in_features (int): Number of input features.
-            out_features (int): Number of output features.
-
-        Attributes:
-            weight (EqualizedWeights): Learnable weight tensor.
-            bias (nn.Parameter): Learnable bias parameter.
-
-        """
         super().__init__()
-        self.weight = EqualizedWeights([in_features, out_features])
-        self.bias = nn.Parameter(torch.zeros(out_features))
+        self.weight = EqualizedWeight([out_features, in_features])
+        self.bias = nn.Parameter(torch.ones(out_features) * bias)
 
     def forward(self, x: torch.Tensor):
-        # Apply linear transformation
-        return F.linear(x, self.weight(), self.bias)
-    
-class MappingNetwork(nn.Module):
-
-    def __inti__(self, features: int, num_layers: int):
-
         """
-        Initialize the MappingNetwork module.
+        Applies a linear transformation to the input tensor.
 
         Args:
-            features (int): Number of features in the network.
-            num_layers (int): Number of layers in the network.
+            x: The input tensor. Should be a 2D tensor of shape (batch_size, in_features).
 
+        Returns:
+            The output tensor of shape (batch_size, out_features).
         """
+        return F.linear(x, self.weight(), bias=self.bias)
+
+
+class EqualizedConv2d(nn.Module):
+
+    def __init__(self, in_features, out_features,
+                 kernel_size, padding = 0):
+
+        super().__init__()
+        self.padding = padding
+        self.weight = EqualizedWeight([out_features, in_features, kernel_size, kernel_size])
+        self.bias = nn.Parameter(torch.ones(out_features))
+
+    def forward(self, x: torch.Tensor):
+        """
+        Applies a 2D convolution over an input signal composed of several input planes.
+
+        Args:
+            x: The input tensor. Should be a 4D tensor of shape (batch_size, in_features, height, width).
+
+        Returns:
+            The output tensor of shape (batch_size, out_features, height, width).
+        """
+        return F.conv2d(x, self.weight(), bias=self.bias, padding=self.padding)
+
+class MappingNetwork(nn.Module):
+
+    def __init__(self, features: int, num_layers: int):
+
         super().__init__()
 
-        
+
         layers = []
         for _ in range(num_layers):
             layers.append(EqualizedLinear(features, features))
-            layers.append(nn.LeakyReLU(0.2, inplace=True))
+            layers.append(nn.LeakyReLU(negative_slope=0.2, inplace=True))
 
         self.net = nn.Sequential(*layers)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, z: torch.Tensor):
 
+        # Normalize
         """
-        Perform a forward pass through the MappingNetwork.
-
-        This function takes an input tensor `x` and applies the following operations:
-        - Normalizes `x` along dimension 1 using `F.normalize`.
-        - Applies the network defined by `self.net` to the normalized input.
+        Processes the input tensor through the mapping network after normalizing it.
 
         Args:
-            x (torch.Tensor): The input tensor.
+            z (torch.Tensor): The input tensor representing latent vectors. 
+                              Should be a 2D tensor of shape (batch_size, features).
 
         Returns:
-            torch.Tensor: The output tensor after applying the network.
-
+            torch.Tensor: The output tensor after passing through the mapping network, 
+                          of the same shape as the input.
         """
-        # Normalize
-        z = F.normalize(x, dim=1)
-        return self.net(z)
-    
-class Conv2dModulate(nn.Module):
 
-    def __init__(self, in_ch, out_ch, kernel_size=3, demodulate: bool = True, eps: float = 1e-8):
+        z = F.normalize(z, dim=1)
+        return self.net(z)
+
+
+class Conv2dWeightModulate(nn.Module):
+
+    def __init__(self, in_features, out_features, kernel_size,
+                 demodulate = True, eps = 1e-8):
+
         super().__init__()
+        self.out_features = out_features
         self.demodulate = demodulate
-        self.out_ch = out_ch
+        self.padding = (kernel_size - 1) // 2
+
+        self.weight = EqualizedWeight([out_features, in_features, kernel_size, kernel_size])
         self.eps = eps
 
-        self.padding = (kernel_size - 1 // 2)
-        self.weight = EqualizedWeights([in_ch, out_ch, kernel_size, kernel_size])
+    def forward(self, x, s):
 
-    def forward(self, x: torch.Tensor, s: torch.Tensor):
-        # [b, c, h, w]
-        b, c, h, w = x.shape
+        """
+        Applies a 2D convolution over an input signal composed of several input planes.
+
+        Args:
+            x: The input tensor. Should be a 4D tensor of shape (batch_size, in_features, height, width).
+            s: The style tensor. Should be a 2D tensor of shape (batch_size, features).
+
+        Returns:
+            The output tensor of shape (batch_size, out_features, height, width).
+        """
+        b, _, h, w = x.shape
+
         s = s[:, None, :, None, None]
-        weights = self.weight()[None, :, :, :, :] * s
+        weights = self.weight()[None, :, :, :, :]
+        weights = weights * s
 
         if self.demodulate:
-            demod = torch.rsqrt((weights**2).sum(dim=(2, 3, 4), keepdim=True) + self.eps)
-            weights = weights * demod
+            sigma_inv = torch.rsqrt((weights ** 2).sum(dim=(2, 3, 4), keepdim=True) + self.eps)
+            weights = weights * sigma_inv
 
-        # [b, c, h, w] -> [1, c, h, w]
-        x = x.view(1, -1, h, w)
+        x = x.reshape(1, -1, h, w)
+
         _, _, *ws = weights.shape
-        weights = weights.view(b * self.out_ch, c // self.out_ch, *ws)
-        x = F.conv2d(x, weights, padding=self.padding, groups=b * self.out_ch)
-        return x.reshape(b, self.out_ch, h, w)
+        weights = weights.reshape(b * self.out_features, *ws)
 
+        x = F.conv2d(x, weights, padding=self.padding, groups=b)
 
+        return x.reshape(-1, self.out_features, h, w)
 
 class StyleBlock(nn.Module):
 
-    def __init__(self, d_model, in_features, out_features):
-        """
-        Initialize the StyleBlock module.
+    def __init__(self, W_DIM, in_features, out_features):
 
-        Args:
-            d_model (int): Input feature dimension of the module.
-            in_features (int): Input feature dimension of the style network.
-            out_features (int): Output feature dimension of the style network.
-
-        Attributes:
-            to_style (EqualizedLinear): Style network.
-            modulate (Conv2dModulate): Modulation layer.
-            bias (nn.Parameter): Learnable bias parameter.
-            scale_noise (nn.Parameter): Learnable noise scaling parameter.
-            activation (nn.LeakyReLU): Activation function.
-
-        """
         super().__init__()
 
-        self.to_style = EqualizedLinear(in_features, out_features)
-        self.modulate = Conv2dModulate(d_model, d_model, kernel_size=3)
+        self.to_style = EqualizedLinear(W_DIM, in_features, bias=1.0)
+        self.conv = Conv2dWeightModulate(in_features, out_features, kernel_size=3)
+        self.scale_noise = nn.Parameter(torch.zeros(1))
+        self.bias = nn.Parameter(torch.zeros(out_features))
 
-        # learnable bias
-        self.bias = nn.Parameter(torch.randn(out_features))
-        self.scale_noise = nn.Parameter(torch.randn(1))
-        self.activation = nn.LeakyReLU(0.2, inplace=True)
-    
-    def forward(self, x: torch.Tensor, w: torch.Tensor, noise: Optional[torch.Tensor]):
+        self.activation = nn.LeakyReLU(0.2, True)
 
+    def forward(self, x, w, noise):
+
+        """
+        Applies the style block to the input tensor.
+
+        Args:
+            x: The input tensor. Should be a 4D tensor of shape (batch_size, in_features, height, width).
+            w: The style tensor. Should be a 2D tensor of shape (batch_size, W_DIM).
+            noise: The noise tensor. Should be a 4D tensor of shape (batch_size, 1, height, width).
+
+        Returns:
+            The output tensor of shape (batch_size, out_features, height, width).
+        """
         s = self.to_style(w)
-
-        x = self.modulate(x, s)
+        x = self.conv(x, s)
         if noise is not None:
             x = x + self.scale_noise[None, :, None, None] * noise
-
         return self.activation(x + self.bias[None, :, None, None])
 
 class ToRGB(nn.Module):
 
-    def __init__(self, d_model, out_features):
+    def __init__(self, W_DIM, features):
+
+        super().__init__()
+        self.to_style = EqualizedLinear(W_DIM, features, bias=1.0)
+
+        self.conv = Conv2dWeightModulate(features, 3, kernel_size=1, demodulate=False)
+        self.bias = nn.Parameter(torch.zeros(3))
+        self.activation = nn.LeakyReLU(0.2, True)
+
+    def forward(self, x, w):
+
         """
-        Initialize the ToRGB module.
+        Applies the ToRGB layer transformations to the input tensor.
 
         Args:
-            d_model (int): Input feature dimension of the module.
-            out_features (int): Output feature dimension of the module.
+            x: The input tensor. Should be a 4D tensor of shape (batch_size, features, height, width).
+            w: The style tensor. Should be a 2D tensor of shape (batch_size, W_DIM).
 
-        Attributes:
-            to_rgb (Conv2dModulate): RGB synthesis layer.
-            bias (nn.Parameter): Learnable bias parameter.
-            activation (nn.LeakyReLU): Activation function.
-            to_style (EqualizedLinear): Style network.
-
+        Returns:
+            The output tensor of shape (batch_size, 3, height, width), representing the RGB image.
         """
-        super().__init__()
 
-        self.to_rgb = Conv2dModulate(out_features, 3, kernel_size=1, demodulate=False)
-        self.bias = nn.Parameter(torch.randn(3))
-
-        self.activation = nn.LeakyReLU(0.2, inplace=True)
-        self.to_style = EqualizedLinear(d_model, out_features)
-
-    def forward(self, x: torch.Tensor, w: torch.Tensor):
-
-        s = self.to_style(w)
-        x = self.to_rgb(x, s)
+        style = self.to_style(w)
+        x = self.conv(x, style)
         return self.activation(x + self.bias[None, :, None, None])
-    
 
 
-class GenertorBlock(nn.Module):
+class GeneratorBlock(nn.Module):
 
-    def __init__(self, d_model, in_features, out_features):
-        """
-        Initialize a GeneratorBlock.
+    def __init__(self, W_DIM, in_features, out_features):
 
-        Args:
-            d_model (int): Input features to the style network.
-            in_features (int): Number of input features.
-            out_features (int): Number of output features.
-
-        Attributes:
-            to_rgb (ToRGB): RGB synthesis layer.
-            to_style_block1 (StyleBlock): First style block.
-            to_style_block2 (StyleBlock): Second style block.
-
-        """
         super().__init__()
 
-        self.to_rgb = ToRGB(d_model, out_features)
-        # two style blocks
-        self.to_style_block1 = StyleBlock(d_model, in_features, out_features)
-        self.to_style_block2 = StyleBlock(d_model, out_features, out_features)
+        self.style_block1 = StyleBlock(W_DIM, in_features, out_features)
+        self.style_block2 = StyleBlock(W_DIM, out_features, out_features)
 
-    def forward(self, x: torch.Tensor, w: torch.Tensor, noise: Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]):
+        self.to_rgb = ToRGB(W_DIM, out_features)
 
-        # input into the first style block
-        x = self.to_style_block1(x, w, noise[0])
+    def forward(self, x, w, noise):
 
-        # input into the second style block
-        x = self.to_style_block2(x, w, noise[1])
+        """
+        Applies the GeneratorBlock transformations to the input tensor.
+
+        Args:
+            x: The input tensor. Should be a 4D tensor of shape (batch_size, in_features, height, width).
+            w: The style tensor. Should be a 2D tensor of shape (batch_size, W_DIM).
+            noise: The noise tensor. Should be a list of two 4D tensors of shape (batch_size, 1, height, width),
+                   where the first tensor represents the noise for the first style block and the second tensor
+                   represents the noise for the second style block.
+
+        Returns:
+            A tuple of two tensors. The first tensor is the output tensor of the second style block, representing
+            the feature map, and the second tensor is the output of the ToRGB layer, representing the RGB image.
+        """
+        x = self.style_block1(x, w, noise[0])
+        x = self.style_block2(x, w, noise[1])
+
         rgb = self.to_rgb(x, w)
 
-
         return x, rgb
-    
+
 class Generator(nn.Module):
 
-    def __init__(self, log_resolution: int, d_model: int , max_features: int = 512, n_features: int = 32 ):
-        """
-        Initialize the Generator module.
+    def __init__(self, log_resolution, W_DIM, n_features = 32, max_features = 256):
 
-        Args:
-            log_resolution (int): Logarithmic resolution to determine feature sizes.
-            d_model: Dimension of the model.
-            max_features (int, optional): Maximum number of features for any layer. Defaults to 512.
-            n_features (int, optional): Number of features in a block. Defaults to 32.
-
-        Attributes:
-            initial_constant (nn.Parameter): Initial constant tensor for the generator.
-            n_blocks (int): Number of generator blocks.
-            to_style (StyleBlock): Initial style block.
-            to_rgb (ToRGB): Initial RGB synthesis layer.
-            blocks (nn.Sequential): Sequence of GeneratorBlock layers.
-            upsample (nn.Upsample): Upsampling layer with a scale factor of 2.
-        """
         super().__init__()
 
-        features = [min(max_features, n_features, 2**i) for i in range(log_resolution, -2, -1)]
-        self.initial_constant = nn.Parameter(torch.randn(1, features[0], 4, 4))
+        features = [min(max_features, n_features * (2 ** i)) for i in range(log_resolution - 2, -1, -1)]
+        self.n_blocks = len(features)
 
-        # number of block 
-        self.n_blocks = len(features) - 1
+        self.initial_constant = nn.Parameter(torch.randn((1, features[0], 4, 4)))
 
-        self.to_style = StyleBlock(d_model, features[0], features[0])
-        self.to_rgb = ToRGB(d_model, features[0])
+        self.style_block = StyleBlock(W_DIM, features[0], features[0])
+        self.to_rgb = ToRGB(W_DIM, features[0])
 
-        # generator blocks
-        blocks = [GenertorBlock(d_model, features[i], features[i+1]) for i in range(self.n_blocks)]
-        self.blocks = nn.Sequential(*blocks)
+        blocks = [GeneratorBlock(W_DIM, features[i - 1], features[i]) for i in range(1, self.n_blocks)]
+        self.blocks = nn.ModuleList(blocks)
 
-        # upsampling
-        self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
+    def forward(self, w, input_noise):
 
-    def forward(self, w: torch.Tensor, noise: Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]):
+        """
+        Applies the Generator transformations to the input tensor.
 
-        # batch size
+        Args:
+            w: The style tensor. Should be a 3D tensor of shape (n_styles, batch_size, W_DIM).
+            input_noise: The noise tensor. Should be a list of n_styles tuples, where each tuple
+                         contains two 4D tensors of shape (batch_size, 1, height, width), representing
+                         the noise for the first style block and the second style block.
+
+        Returns:
+            The output tensor of shape (batch_size, 3, height, width), representing the RGB image.
+        """
         batch_size = w.shape[1]
 
-        # initial constant
-        x = self.initial_constant.expand(batch_size, 1, 1, 1)
+        x = self.initial_constant.expand(batch_size, -1, -1, -1)
+        x = self.style_block(x, w[0], input_noise[0][1])
+        rgb = self.to_rgb(x, w[0])
 
-        x = self.to_style(x, w[0], noise[0])
-
-        
         for i in range(1, self.n_blocks):
-            # upsampling
-            x = self.upsample(x)
-            x, rgb = self.blocks[i-1](x, w[i], noise[i])
-            x = self.upsample(rgb)
+            x = F.interpolate(x, scale_factor=2, mode="bilinear")
+            x, rgb_new = self.blocks[i - 1](x, w[i], input_noise[i])
+            rgb = F.interpolate(rgb, scale_factor=2, mode="bilinear") + rgb_new
 
-        x = self.to_rgb(x, w[-1])
+        return torch.tanh(rgb)
 
-        return x
-
+    
 
 class DiscriminatorBlock(nn.Module):
 
     def __init__(self, in_features, out_features):
-
         super().__init__()
+        self.residual = nn.Sequential(nn.AvgPool2d(kernel_size=2, stride=2), # down sampling using avg pool
+                                      EqualizedConv2d(in_features, out_features, kernel_size=1))
 
-        # residual
-        self.residual = nn.Sequential(nn.AvgPool2d(2, stride=2),
-                                      EqualizedLinear(in_features, out_features, kernel_size=1))
-        
-        # two convolutional layers
-        self.blocks = nn.Sequential(EqualizedLinear(in_features, out_features, kernel_size=3, padding=1),
-                                    nn.LeakyReLU(0.2, inplace=True),
-                                    EqualizedLinear(out_features, out_features, kernel_size=3, padding=1),
-                                    nn.LeakyReLU(0.2, inplace=True))
-        
-        self.downsample = nn.AvgPool2d(2, stride=2)
+        self.block = nn.Sequential(
+            EqualizedConv2d(in_features, in_features, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.2, True),
+            EqualizedConv2d(in_features, out_features, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.2, True),
+        )
+
+        self.down_sample = nn.AvgPool2d(
+            kernel_size=2, stride=2
+        )  # down sampling using avg pool
 
         self.scale = 1 / np.sqrt(2)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x):
+        """
+        Applies the DiscriminatorBlock transformations to the input tensor.
 
-        res = self.residual(x)
-        x = self.blocks(x)
-        x = self.downsample(x)
-        return self.scale * (x + res)
+        Args:
+            x: The input tensor. Should be a 4D tensor of shape (batch_size, in_features, height, width).
+
+        Returns:
+            The output tensor of shape (batch_size, out_features, height/2, width/2),
+            after applying down-sampling, convolution, and residual connections.
+        """
+
+        residual = self.residual(x)
+
+        x = self.block(x)
+
+        
+        x = self.down_sample(x)
+
+        return (x + residual) * self.scale
+
 
 class Discriminator(nn.Module):
 
     def __init__(self, log_resolution, n_features = 64, max_features = 256):
+
         super().__init__()
-        
-        features = [min(max_features, n_features * (2 ** i)) for i in range(log_resolution - 1)]
+
+        features = [min(max_features, n_features * (2 ** i)) for i in range(log_resolution)]
 
         self.from_rgb = nn.Sequential(
-            Conv2dModulate(3, n_features, 1),
-            nn.LeakyReLU(0.2, True)
+            EqualizedConv2d(3, n_features, 1),
+            nn.LeakyReLU(0.2, True),
         )
-
         n_blocks = len(features) - 1
         blocks = [DiscriminatorBlock(features[i], features[i + 1]) for i in range(n_blocks)]
         self.blocks = nn.Sequential(*blocks)
 
         final_features = features[-1] + 1
-        self.conv = Conv2dModulate(final_features, final_features, 3)
+        self.conv = EqualizedConv2d(final_features, final_features, 3)
         self.final = EqualizedLinear(2 * 2 * final_features, 1)
 
+
     def minibatch_std(self, x):
-        batch_stats = (
+        """
+        Computes the minibatch standard deviation for the input tensor.
+
+        Args:
+            x: The input tensor. Should be a 4D tensor of shape (batch_size, features, height, width).
+
+        Returns:
+            The output tensor of shape (batch_size, features + 1, height, width), where the last feature
+            dimension contains the minibatch standard deviation.
+        """
+
+        batch_statistics = (
             torch.std(x, dim=0).mean().repeat(x.shape[0], 1, x.shape[2], x.shape[3])
-
         )
-
-        return torch.cat([x, batch_stats], dim=1)
+        return torch.cat([x, batch_statistics], dim=1)
 
     def forward(self, x):
 
         x = self.from_rgb(x)
         x = self.blocks(x)
-        x = self.minibatch_std(x)
 
+        x = self.minibatch_std(x)
         x = self.conv(x)
         x = x.reshape(x.shape[0], -1)
-
         return self.final(x)
